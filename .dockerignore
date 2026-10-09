@@ -1,0 +1,7 @@
+.env
+.env.*
+.git
+.github
+*.log
+target/*.jar.original
+target/test-classes
