@@ -1,8 +1,47 @@
 # ms-digitalfix-notify
 
-Microservicio de notificaciones de DigitalFix. Actúa como **consumer de RabbitMQ** (Spring AMQP) y procesa tres tipos de comando: email/push al cliente, ticket de despacho al técnico y generación de PDF. No expone endpoints de dominio; solo actuator en el puerto `8086`.
+Microservicio de notificaciones de DigitalFix. Actúa como **consumidor (consumer) de RabbitMQ** (Spring AMQP) de los comandos que publica `ms-digitalfix-workorders` (productor) y procesa tres tipos: email/push al cliente, ticket de despacho al técnico y generación de PDF. No expone endpoints de dominio; solo actuator en el puerto `8086`.
 
-> Estado: topología, consumo, ACK/NACK, idempotencia y métricas están implementados. La acción de negocio de cada handler (enviar email, crear ticket, generar PDF) sigue como `TODO` en [CommandConsumer](src/main/java/cl/duoc/digitalfix/consumer/CommandConsumer.java) y por ahora solo registra el mensaje en el log.
+> Estado: topología, consumo, ACK/NACK, idempotencia y métricas están implementados. La acción de negocio de cada handler (enviar email, crear ticket, generar PDF) sigue como `TODO` en [CommandConsumer](src/main/java/cl/duoc/digitalfix/consumer/CommandConsumer.java) y por ahora solo registra el mensaje en el log y en consola.
+
+## Rol en la arquitectura
+
+```text
+ms-digitalfix-workorders (productor) ──► RabbitMQ (cmd.direct) ──► ms-digitalfix-notify (consumer)
+                                                                        │
+                                       CommandConsumer ─► MessageProcessor ─► handler ─► ACK / NACK
+```
+
+| Clase | Responsabilidad |
+|---|---|
+| [RabbitMQConfig](src/main/java/cl/duoc/digitalfix/config/RabbitMQConfig.java) | Declara exchanges, colas, DLQ y bindings (el consumer es dueño de la topología) |
+| [CommandConsumer](src/main/java/cl/duoc/digitalfix/consumer/CommandConsumer.java) | Un `@RabbitListener` por cola (`onEmail`, `onDispatch`, `onReport`) |
+| [MessageProcessor](src/main/java/cl/duoc/digitalfix/messaging/MessageProcessor.java) | Parseo, validación, idempotencia, ACK/NACK, métricas y salida por consola |
+| [IdempotencyStore](src/main/java/cl/duoc/digitalfix/messaging/IdempotencyStore.java) | Evita reprocesar un `eventId` ya visto |
+| [MessageEnvelope](src/main/java/cl/duoc/digitalfix/messaging/MessageEnvelope.java) | Envelope común de los mensajes |
+
+## Flujo de consumo de un mensaje
+
+1. Llega un mensaje a `q.cmd.email`, `q.cmd.dispatch` o `q.cmd.report` y lo recibe el listener correspondiente.
+2. `MessageProcessor` imprime el mensaje recibido y lo parsea como envelope.
+3. Si el JSON es inválido o faltan `type`/`eventId` → `NACK` sin requeue → `cmd.dead.dlx` → `q.cmd.*.dlq`.
+4. Si `cola:eventId` ya fue procesado → `ACK` y se descarta (`duplicate`).
+5. Si no, ejecuta el handler del listener (log y salida por consola; aquí irá la lógica de negocio).
+6. Éxito → `ACK`. Falla la primera vez → `NACK` con requeue (un reintento). Falla tras reentrega → `NACK` sin requeue → DLQ.
+
+## Mensajes que consume (emitidos por workorders)
+
+| Cola | Routing key | `type` | Se genera cuando la orden pasa a |
+|---|---|---|---|
+| `q.cmd.email` | `email.send` | `EMAIL_ORDER_ASSIGNED` | `ASSIGNED` |
+| `q.cmd.email` | `email.send` | `EMAIL_TECHNICIAN_EN_ROUTE` | `EN_ROUTE` |
+| `q.cmd.email` | `email.send` | `EMAIL_WORK_STARTED` | `IN_PROGRESS` |
+| `q.cmd.email` | `email.send` | `EMAIL_ORDER_CLOSED` | `CLOSED` |
+| `q.cmd.email` | `email.send` | `EMAIL_ORDER_CANCELLED` | `CANCELLED` |
+| `q.cmd.dispatch` | `dispatch.ticket` | `DISPATCH_TICKET_REQUESTED` | `ASSIGNED` |
+| `q.cmd.report` | `report.gen` | `REPORT_GENERATION_REQUESTED` | `CLOSED` |
+
+El `payload` trae `orderId`, `customerId`, `serviceId`, `technicianId`, `status`, `title`, `description`, `address` y `observations`.
 
 ## Topología RabbitMQ
 
@@ -20,7 +59,7 @@ Declarada en [RabbitMQConfig](src/main/java/cl/duoc/digitalfix/config/RabbitMQCo
 
 | Cola principal | Propósito | DLQ | Binding direct | Binding topic |
 |---|---|---|---|---|
-| `q.cmd.email` | Email/push al cliente (asignada, técnico en camino, cerrada) | `q.cmd.email.dlq` | `email.send` | `email.*` |
+| `q.cmd.email` | Email/push al cliente (asignada, técnico en camino, trabajo iniciado, cancelada, cerrada) | `q.cmd.email.dlq` | `email.send` | `email.*` |
 | `q.cmd.dispatch` | Ticket de despacho / orden de terreno al técnico | `q.cmd.dispatch.dlq` | `dispatch.ticket` | `dispatch.#` |
 | `q.cmd.report` | Generación de PDF (informe técnico o certificado de trabajo) | `q.cmd.report.dlq` | `report.gen` | `report.*` |
 
@@ -46,7 +85,7 @@ Todos los mensajes deben ser JSON con este envelope ([MessageEnvelope](src/main/
   "timestamp": "2026-10-09T13:00:00Z",
   "traceId": "trace-123",
   "correlationId": "order-456",
-  "payload": { "orderId": 456, "customerEmail": "cliente@example.com" }
+  "payload": { "orderId": "60663ba9-f13d-4f9a-a990-295f61d5cb08", "customerId": "cliente@example.com", "status": "ASSIGNED" }
 }
 ```
 
@@ -116,6 +155,16 @@ spring:
         prefetch: 10
 ```
 
+## Salida por consola (demostración)
+
+Para cada mensaje, notify imprime en consola (solo con fines demostrativos; en producción usar únicamente el logger):
+
+1. `MENSAJE RECIBIDO DE RABBITMQ`: cola, propiedades y cuerpo (`MessageProcessor`).
+2. `CONSUMER [EMAIL|DISPATCH|REPORT]`: type, eventId, timestamp, traceId, correlationId y payload (listener de `CommandConsumer`; solo mensajes válidos y no duplicados).
+3. `MENSAJE PROCESADO`: resultado `OK (ACK)`, `DUPLICADO`, `ERROR` o `RECHAZADO` (`MessageProcessor`).
+
+Esa salida aparece en la terminal donde se ejecutó `mvn spring-boot:run`.
+
 ## Ejecutar y probar
 
 Levantar RabbitMQ local (management UI en http://localhost:15672, `guest`/`guest`):
@@ -129,9 +178,12 @@ mvn clean verify
 mvn spring-boot:run
 ```
 
+Notify debe iniciarse primero (o al menos una vez) para declarar colas y bindings; luego el productor puede publicar.
+
 Comprobaciones:
 
 - `GET http://localhost:8086/actuator/health`
-- En el management UI, publicar un mensaje en el exchange `cmd.direct` con routing key `email.send` y el envelope JSON de arriba; el log debe mostrar `[EMAIL] type=... eventId=...`.
+- **Flujo real:** con workorders en ejecución, cambia el estado de una orden (front o `PUT http://localhost:8081/api/workorders/{id}/status`); en la consola de notify aparecen los tres bloques y `Resultado : OK (ACK)`.
+- **Manual:** en el management UI, publicar en el exchange `cmd.direct` con routing key `email.send` y el envelope JSON de arriba.
 - Publicar el mismo `eventId` dos veces: el segundo se descarta como `duplicate`.
-- Publicar un JSON inválido: el mensaje termina en `q.cmd.email.dlq` y aumenta `notify.messages{result="dlq"}`.
+- **Provocar la DLQ:** publicar un JSON inválido, o desde el front usar el bloque plegable "Demo RabbitMQ" (workorders `POST /api/workorders/demo/dlq?queue=email&mode=invalid-json`). El mensaje termina en `q.cmd.email.dlq`, la consola muestra `RECHAZADO` y aumenta `notify.messages{result="dlq"}`.
