@@ -60,17 +60,17 @@ public class RabbitMQConfig {
     // Dead letter queues
     @Bean
     Queue emailDlq() {
-        return QueueBuilder.durable(Q_EMAIL_DLQ).build();
+        return quorumQueue(Q_EMAIL_DLQ);
     }
 
     @Bean
     Queue dispatchDlq() {
-        return QueueBuilder.durable(Q_DISPATCH_DLQ).build();
+        return quorumQueue(Q_DISPATCH_DLQ);
     }
 
     @Bean
     Queue reportDlq() {
-        return QueueBuilder.durable(Q_REPORT_DLQ).build();
+        return quorumQueue(Q_REPORT_DLQ);
     }
 
     // Bindings DLQ
@@ -123,8 +123,15 @@ public class RabbitMQConfig {
 
     private Queue mainQueue(String name, String dlq) {
         return QueueBuilder.durable(name)
+                .quorum()
                 .deadLetterExchange(EXCHANGE_DLX)
                 .deadLetterRoutingKey(dlq)
+                .build();
+    }
+
+    private Queue quorumQueue(String name) {
+        return QueueBuilder.durable(name)
+                .quorum()
                 .build();
     }
 }

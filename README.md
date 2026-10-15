@@ -65,6 +65,10 @@ Declarada en [RabbitMQConfig](src/main/java/cl/duoc/digitalfix/config/RabbitMQCo
 
 Cada cola principal define `x-dead-letter-exchange=cmd.dead.dlx` y `x-dead-letter-routing-key=<nombre de la DLQ>`. Cada DLQ está ligada a `cmd.dead.dlx` con su propio nombre como routing key.
 
+Las seis colas (principales y DLQ) son **quorum queues** (`x-queue-type=quorum`), por lo que RabbitMQ replica los mensajes entre los nodos del clúster. RabbitMQ replica automáticamente la metadata de exchanges, colas y bindings; para replicar el contenido de las colas se requiere un tipo de cola replicado como quorum. `queue_leader_locator=balanced` solo distribuye líderes de colas clásicas, no replica sus mensajes.
+
+En un clúster de dos nodos, el quorum necesita ambos nodos disponibles para mantener mayoría. Si uno cae, las quorum queues dejan de aceptar operaciones hasta recuperar la mayoría. Para alta disponibilidad ante la caída de un nodo, configura tres nodos.
+
 ```
 Productor ──► cmd.direct / cmd.topic ──► q.cmd.* ──► CommandConsumer
                                             │ (NACK sin requeue)
@@ -72,7 +76,7 @@ Productor ──► cmd.direct / cmd.topic ──► q.cmd.* ──► CommandCo
                                        cmd.dead.dlx ──► q.cmd.*.dlq
 ```
 
-> Las colas se declaran con argumentos (DLX). Si ya existían en el broker con otros argumentos, RabbitMQ rechaza la redeclaración (`PRECONDITION_FAILED`): elimínalas antes de arrancar.
+> **Migración:** RabbitMQ no permite cambiar una cola classic existente a quorum redeclarando el mismo nombre. Migra con nombres nuevos y mueve los mensajes, o respalda/drena y elimina las colas existentes antes de recrearlas. Eliminar una cola descarta sus mensajes pendientes. Una diferencia en los argumentos DLX también provoca `PRECONDITION_FAILED`.
 
 ## Formato de mensaje (envelope)
 
@@ -138,8 +142,9 @@ Variables en `.env` (o entorno), leídas por [application.yml](src/main/resource
 |---|---|---|
 | `RABBITMQ_HOST` | `localhost` | Host del broker |
 | `RABBITMQ_PORT` | `5672` | Puerto AMQP |
-| `RABBITMQ_USERNAME` | `guest` | Usuario |
-| `RABBITMQ_PASSWORD` | `guest` | Contraseña (no usar `guest` fuera de local) |
+| `RABBITMQ_ADDRESSES` | vacío | Direcciones del clúster separadas por coma, p. ej. `localhost:5672,localhost:5673`; si se configura, prevalece sobre host/port |
+| `RABBITMQ_USERNAME` | `admin` | Usuario (el del `docker-compose.yml` del clúster local) |
+| `RABBITMQ_PASSWORD` | `admin123` | Contraseña (valor de desarrollo; usar secretos fuera de local) |
 | `RABBITMQ_VHOST` | `/` | Virtual host |
 | `SERVER_PORT` | `8086` | Puerto HTTP (actuator) |
 
@@ -155,6 +160,17 @@ spring:
         prefetch: 10
 ```
 
+Para el clúster local de dos nodos, configura `.env` tanto en notify como en workorders:
+
+```env
+RABBITMQ_ADDRESSES=localhost:5672,localhost:5673
+RABBITMQ_USERNAME=admin
+RABBITMQ_PASSWORD=admin123
+RABBITMQ_VHOST=/
+```
+
+Usa los puertos y credenciales definidos por tu clúster. La lista permite al cliente conectarse a cualquiera de los nodos; la replicación de los mensajes la realiza el tipo quorum de las colas.
+
 ## Salida por consola (demostración)
 
 Para cada mensaje, notify imprime en consola (solo con fines demostrativos; en producción usar únicamente el logger):
@@ -167,7 +183,7 @@ Esa salida aparece en la terminal donde se ejecutó `mvn spring-boot:run`.
 
 ## Ejecutar y probar
 
-Levantar RabbitMQ local (management UI en http://localhost:15672, `guest`/`guest`):
+Levantar RabbitMQ local. Con el clúster de `docker-compose.yml` (2 nodos) la UI está en http://localhost:15672 y http://localhost:15673 (`admin`/`admin123`). Para un solo nodo de pruebas:
 
 ```powershell
 docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
